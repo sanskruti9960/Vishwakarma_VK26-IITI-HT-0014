@@ -1,0 +1,418 @@
+#include <Wire.h>
+#include <math.h>
+#include <TinyGPS++.h>
+#include <HardwareSerial.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+#include <Preferences.h>
+#include <ArduinoJson.h>
+
+/* ================= HARDWARE PINS ================= */
+#define MPU_ADDR 0x68
+// GPS using Serial1 (GPIO 16=RX, 17=TX) - Note: Cross-wired!
+HardwareSerial gpsSerial(1); 
+#define GPS_RX 16
+#define GPS_TX 17
+
+// SIM800L using Serial2 (GPIO 26=RX, 27=TX) - Note: Cross-wired!
+HardwareSerial simSerial(2);
+#define SIM_RX 26
+#define SIM_TX 27
+
+TinyGPSPlus gps;
+
+/* ================= THRESHOLDS ================= */
+#define TILT_THRESHOLD 45.0
+#define IMPACT_THRESHOLD 24000
+
+/* ================= STATE VARIABLES ================= */
+Preferences preferences; // Save contacts permanently
+BLECharacteristic *pCharacteristic;
+bool deviceConnected = false;
+bool accidentTriggered = false;
+bool isArmed = false; // System waits for sync before arming
+double lastLat = 0.0;
+double lastLon = 0.0;
+
+#define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+#define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+
+/* ================= FUNCTION PROTOTYPES ================= */
+void setupMPU();
+void setupGPS();
+void setupBLE();
+void setupSIM800();
+void updateGPS();
+void checkAccident();
+void sendAlert();
+void processAndSend(String json);
+void sendSMS(String phone, String message);
+void makeCall(String phone);
+
+/* ================= BLE CALLBACKS ================= */
+class MyServerCallbacks: public BLEServerCallbacks {
+    void onConnect(BLEServer* pServer) {
+      deviceConnected = true;
+      Serial.println("✅ App Connected");
+    };
+    void onDisconnect(BLEServer* pServer) {
+      deviceConnected = false;
+      Serial.println("❌ App Disconnected");
+      pServer->getAdvertising()->start();
+    }
+};
+
+class MyCallbacks: public BLECharacteristicCallbacks {
+    void onWrite(BLECharacteristic *pCharacteristic) {
+      String value = pCharacteristic->getValue();
+      
+      if (value.length() > 0) {
+        Serial.println("📥 Received Data Packet:");
+        Serial.println(value.c_str());
+
+        DynamicJsonDocument doc(2048);
+        DeserializationError error = deserializeJson(doc, value.c_str());
+
+        if (!error && doc["cmd"] == "SYNC_CONTACTS") {
+           Serial.println("💾 Contacts Received!");
+           
+           // Validating data
+           JsonArray contacts = doc["contacts"];
+           if (contacts.size() > 0) {
+               preferences.begin("healthapp", false);
+               preferences.putString("userData", value.c_str());
+               preferences.end();
+               Serial.println("✅ Contacts Saved. SYSTEM ARMED. Ready for detection.");
+               isArmed = true; // ENABLE DETECTION NOW
+           } else {
+               Serial.println("⚠ Received empty contact list!");
+           }
+        }
+      }
+    }
+};
+
+/* ================= SETUP ================= */
+void setup() {
+  Serial.begin(115200);
+  
+  setupMPU();
+  setupBLE();   // Init BLE first so we can connect while SIM boots
+  setupGPS();
+  setupSIM800(); // Initialize GSM
+
+  // Check storage for existing User Data
+  preferences.begin("healthapp", false); // Read/Write
+  String savedData = preferences.getString("userData", "");
+  
+  if(savedData != "" && savedData != "{}") {
+      Serial.println("📂 Loaded Saved User Data!");
+      // Check if it looks valid
+      if(savedData.indexOf("contacts") > 0) {
+          isArmed = true;
+          Serial.println("✅ SYSTEM ARMED (Using Saved Data).");
+      }
+  } else {
+      Serial.println("ℹ No saved data. Waiting for Bluetooth Sync...");
+      isArmed = false;
+  }
+  preferences.end();
+  
+  Serial.println("🚀 System Ready (SIM800L Mode)");
+}
+
+/* ================= LOOP ================= */
+void loop() {
+  updateGPS();
+  checkAccident();
+  delay(100);
+}
+
+/* ================= HELPER FUNCTIONS ================= */
+
+void setupMPU() {
+  Wire.begin(21, 22);
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x6B); // Power Management
+  Wire.write(0);    // Wake up
+  Wire.endTransmission(true);
+
+  // Configure Accelerometer Sensitivity to +/- 16g
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x1C); // ACCEL_CONFIG register
+  Wire.write(0x18); // 00011000 = +/- 16g
+  Wire.endTransmission(true);
+}
+
+void setupGPS() {
+  gpsSerial.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX);
+  Serial.println("📡 GPS Initialized...");
+}
+
+void setupSIM800() {
+  // Try to auto-detect baud rate
+  long baudRates[] = {9600, 38400, 115200, 57600, 19200};
+  bool found = false;
+
+  for (int i = 0; i < 5; i++) {
+      Serial.print("Testing Baud Rate: "); Serial.println(baudRates[i]);
+      simSerial.begin(baudRates[i], SERIAL_8N1, SIM_RX, SIM_TX);
+      delay(500);
+      
+      // Send AT command
+      simSerial.println("AT");
+      delay(200);
+      
+      // Check response
+      String r = "";
+      while(simSerial.available()) r += (char)simSerial.read();
+      
+      if (r.indexOf("OK") != -1) {
+          Serial.println("✅ Found SIM800L at " + String(baudRates[i]));
+          found = true;
+          break;
+      }
+      simSerial.end(); // Close to retry
+      delay(200);
+  }
+
+  if (!found) {
+    Serial.println("❌ Could not detect SIM800L. Trying default 9600...");
+    simSerial.begin(9600, SERIAL_8N1, SIM_RX, SIM_TX);
+  }
+
+  // Force 9600 for stability
+  delay(500);
+  simSerial.println("AT+IPR=9600"); 
+  delay(500);
+  simSerial.println("AT&W"); // Save configuration
+  delay(500);
+  
+  simSerial.begin(9600, SERIAL_8N1, SIM_RX, SIM_TX); // Restart at 9600
+  delay(1000);
+
+  // Check SIM Card Status
+  Serial.println("Checking SIM Status...");
+  while(simSerial.available()) simSerial.read(); // Flush buffer
+  simSerial.println("AT+CPIN?");
+  delay(1000);
+  while(simSerial.available()) Serial.write(simSerial.read());
+
+  // Check Signal Quality
+  simSerial.println("AT+CSQ");
+  delay(1000);
+  while(simSerial.available()) Serial.write(simSerial.read());
+
+  // Set SMS to Text Mode
+  simSerial.println("AT+CMGF=1"); 
+  delay(1000);
+  // Disable Echo to reduce noise
+  simSerial.println("ATE0"); 
+  delay(1000);
+  
+  Serial.println("✅ SIM800L Ready & Armed (9600 Baud).");
+}
+
+void setupBLE() {
+  BLEDevice::init("HealthCard IoT");
+  BLEServer *pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
+  BLEService *pService = pServer->createService(SERVICE_UUID);
+  pCharacteristic = pService->createCharacteristic(CHARACTERISTIC_UUID, BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_NOTIFY);
+  pCharacteristic->setCallbacks(new MyCallbacks());
+  pService->start();
+  BLEDevice::startAdvertising();
+  Serial.println("📡 BLE Advertising... Waiting for App Sync...");
+}
+
+void updateGPS() {
+  while (gpsSerial.available()) gps.encode(gpsSerial.read());
+}
+
+void checkAccident() {
+  // CRITICAL CHANGE: Only check for accident IF user has synced contacts!
+  if (!isArmed) {
+      static unsigned long lastLog = 0;
+      if (millis() - lastLog > 2000) {
+          Serial.println("⏳ Waiting for Contacts Sync via Bluetooth...");
+          lastLog = millis();
+      }
+      return; 
+  }
+
+  if (accidentTriggered) return;
+
+  /* MPU Reading */
+  int16_t ax, ay, az;
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x3B);
+  Wire.endTransmission(false);
+  Wire.requestFrom(MPU_ADDR, 6, true);
+  ax = Wire.read() << 8 | Wire.read();
+  ay = Wire.read() << 8 | Wire.read();
+  az = Wire.read() << 8 | Wire.read();
+
+  long accMagnitude = sqrt((long)ax * ax + (long)ay * ay + (long)az * az);
+  float roll = atan2(ay, az) * 57.3;
+  float pitch = atan2(-ax, sqrt((float)ay * ay + (float)az * az)) * 57.3;
+
+  // Debug Print every 1s
+  static unsigned long lastPrint = 0;
+  if(millis() - lastPrint > 1000) {
+     Serial.print("Roll: "); Serial.print(roll);
+     Serial.print(" | Mag: "); Serial.println(accMagnitude);
+     lastPrint = millis();
+  }
+
+  if (abs(roll) > TILT_THRESHOLD || abs(pitch) > TILT_THRESHOLD || accMagnitude > IMPACT_THRESHOLD) {
+    accidentTriggered = true;
+    Serial.println("🚨 ACCIDENT DETECTED! 🚨");
+    sendAlert();
+  }
+}
+
+void sendAlert() {
+  // Free BLE memory just in case, though Serial is light
+  BLEDevice::deinit(true);
+  
+  // DIAGNOSTICS
+  Serial.println("🔍 Checking Network & Power...");
+  simSerial.println("AT+CSQ"); // Signal Quality
+  delay(500);
+  while(simSerial.available()) Serial.write(simSerial.read());
+
+  simSerial.println("AT+CBC"); // Battery Voltage
+  delay(500);
+  while(simSerial.available()) Serial.write(simSerial.read());
+  
+  simSerial.println("AT+CREG?"); // Network Registration
+  delay(500);
+  while(simSerial.available()) Serial.write(simSerial.read());
+  
+  preferences.begin("healthapp", true);
+  String json = preferences.getString("userData", "");
+  preferences.end();
+
+  if (json != "") {
+     processAndSend(json);
+  } else {
+     Serial.println("⚠ No contacts found!");
+  }
+  
+  Serial.println("🛑 System Locked.");
+}
+
+void processAndSend(String json) {
+
+   DynamicJsonDocument doc(2048);
+   deserializeJson(doc, json);
+
+   String userName = doc["userName"].as<String>();
+   String qrLink   = doc["qrLink"].as<String>();    // Extract dynamic link sent from App
+   JsonArray contacts = doc["contacts"];
+
+   String message = "🚨 SOS! Accident Detected!\n";
+   message += userName + " needs help!\n";
+
+   // ----------- DYNAMIC LINK HERE -----------
+   if (qrLink.length() > 0) {
+       message += "HealthCard:\n" + qrLink + "\n";
+   } else {
+       message += "HealthCard:\n(No link synced)\n";
+   }
+
+   if (gps.location.isValid()) {
+       message += "Location:\nhttps://maps.google.com/?q=";
+       message += String(lastLat, 6);
+       message += ",";
+       message += String(lastLon, 6);
+   } else {
+       message += "GPS Searching...";
+   }
+
+   for(JsonObject contact : contacts) {
+
+      String phone = contact["phone"].as<String>();
+
+      Serial.println("📨 Sending SMS to " + phone);
+      sendSMS(phone, message);
+
+      delay(5000);
+
+      Serial.println("📞 Calling " + phone);
+      makeCall(phone);
+
+      delay(10000);
+   }
+}
+
+
+/* ================= STATE VARIABLES ================= */
+// ... existing ...
+
+/* ================= HELPER: Wait for Response ================= */
+String waitForResponse() {
+    String response = "";
+    long timeout = millis() + 5000;
+    while(millis() < timeout) {
+        if(simSerial.available()) {
+            char c = simSerial.read();
+            response += c;
+        }
+    }
+    // Serial.print("SIM Output: "); // Debug print
+    Serial.println(response);
+    return response;
+}
+
+void sendSMS(String phone, String message) {
+  Serial.println("📨 Preparing SMS to " + phone);
+  
+  simSerial.println("AT+CMGF=1"); // Text Mode 
+  delay(100);
+  
+  while(simSerial.available()) simSerial.read(); // Flush junk
+  
+  simSerial.print("AT+CMGS=\"");
+  simSerial.print(phone);
+  simSerial.println("\"");
+  delay(500);
+  
+  simSerial.print(message);
+  delay(500);
+  
+  simSerial.write(26); // CTR+Z to send
+  
+  String res = waitForResponse();
+  if (res.indexOf("OK") != -1 && res.indexOf("ERROR") == -1) {
+      Serial.println("✅ SMS Sent Successfully");
+  } else {
+      Serial.println("❌ SMS Failed (Check SIM/Power)");
+  }
+}
+
+void makeCall(String phone) {
+  Serial.println("📞 Dialing " + phone + "...");
+  
+  while(simSerial.available()) simSerial.read(); // Flush junk
+  simSerial.print("ATD");
+  simSerial.print(phone);
+  simSerial.println(";"); 
+  
+  String res = waitForResponse();
+  
+  if (res.indexOf("OK") != -1) {
+      Serial.println("✅ Call In Progress...");
+      delay(20000); // Wait 20 seconds
+      simSerial.println("ATH"); // Hang up
+      Serial.println("⏹ Call Ended");
+  } else if (res.indexOf("NO CARRIER") != -1) {
+      Serial.println("❌ Call Failed: No Signal/Sim");
+  } else if (res.indexOf("ERROR") != -1) {
+      Serial.println("❌ Call Failed: Error");
+  } else {
+      Serial.println("⚠ Call State Unknown: " + res);
+  }
+}
